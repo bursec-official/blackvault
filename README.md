@@ -7,7 +7,7 @@
   <img alt="Ubuntu Server 24.04 or newer" src="https://img.shields.io/badge/Ubuntu%20Server-24.04%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white">
   <img alt="PHP 8.3 or newer" src="https://img.shields.io/badge/PHP-8.3%2B-777BB4?style=flat-square&logo=php&logoColor=white">
   <img alt="Apache 2.4" src="https://img.shields.io/badge/Apache-2.4-D22128?style=flat-square&logo=apache&logoColor=white">
-  <a href="LICENSE"><img alt="License AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-3d7dca?style=flat-square"></a>
+  <a href="#license"><img alt="License: PolyForm Shield 1.0.0" src="https://img.shields.io/badge/license-PolyForm%20Shield-3d7dca?style=flat-square"></a>
   <a href="https://github.com/bursec-official/blackvault/actions/workflows/check.yml"><img alt="Checks" src="https://img.shields.io/github/actions/workflow/status/bursec-official/blackvault/check.yml?branch=main&style=flat-square&label=checks"></a>
 </p>
 
@@ -218,6 +218,12 @@ Bug reports and ideas are welcome: open an [issue](https://github.com/bursec-off
 
 ## License
 
-Black Vault is free software under the [GNU AGPL-3.0](LICENSE). You can use, study, change and share it. If you change it and offer it to others (including over a network), you must share your changes under the same license.
+Black Vault is **free to use for everyone**, companies included, under the [PolyForm Shield License 1.0.0](LICENSE).
+
+- ✅ **Allowed:** use it at home, in your company, school or organisation, for your own files and your own team. Read the code, change it, share it.
+- ❌ **Not allowed:** selling Black Vault or a copy of it, charging others for installing, hosting or managing it, or offering it (changed or renamed) as your own product or service, even for free.
+- 📝 **Always:** keep the copyright notice and the license with every copy.
+
+**Want to sell it, or offer it to your clients?** You need a commercial license from the author. [Ask for one here](https://github.com/bursec-official/blackvault/issues/new?template=commercial_license.yml).
 
 Included third-party work: [Lucide](https://lucide.dev) icons (ISC), [Manrope](https://github.com/sharanda/manrope) and [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) fonts (SIL Open Font License). Their licenses are next to the files.

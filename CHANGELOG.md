@@ -2,6 +2,9 @@
 
 ## 2.4.0 — first public release
 
+**License**
+- Free to use for everyone, companies included, under the PolyForm Shield License 1.0.0. Selling it or offering it to others as a product or service needs a commercial license from the author.
+
 **New**
 - **First-time setup in the browser.** A new server opens a setup page: type the one-time code shown by the installer, create the administrator (named `admin` by default), optionally add your first user, done.
 - The installer now works on a fresh Ubuntu Server: it installs Apache and PHP when they are missing and uses the server's own time zone.

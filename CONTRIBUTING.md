@@ -42,4 +42,4 @@ for f in install.sh tools/blackvault-tls; do bash -n "$f"; done   # shell syntax
 
 Then try it for real on a test Ubuntu Server (a virtual machine is fine): run `sudo bash install.sh` and read its self-test at the end. Every check should show ✔.
 
-By sending a pull request, you agree that your changes are published under the project's license ([AGPL-3.0](LICENSE)).
+By sending a pull request, you agree that your changes are published under the project's license ([PolyForm Shield 1.0.0](LICENSE)), and that the author may also include them in commercial licenses of Black Vault.

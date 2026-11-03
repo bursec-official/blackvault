@@ -1,0 +1,17 @@
+name: Commercial license
+description: Ask about selling Black Vault or offering it to your clients
+title: "Commercial license"
+labels: [commercial]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Anyone can use Black Vault for free, companies included. Selling it, or charging others for installing, hosting or managing it, needs a commercial license from the author.
+        Don't share private details here: just say what you'd like to do, and you'll be contacted.
+  - type: textarea
+    id: use
+    attributes:
+      label: How would you like to use Black Vault?
+      description: For example, "install it for my clients" or "sell it as part of a NAS".
+    validations:
+      required: true
