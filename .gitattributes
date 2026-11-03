@@ -1,0 +1,5 @@
+# Shell scripts must keep Unix line endings, even when cloned on Windows
+* text=auto eol=lf
+*.png binary
+*.woff2 binary
+*.svg text eol=lf

@@ -1,0 +1,10 @@
+# Bloquea cualquier acceso directo por navegador a los archivos guardados.
+# Todo debe pasar por api/download.php, que exige login.
+Require all denied
+
+<IfModule mod_php.c>
+    php_flag engine off
+</IfModule>
+<FilesMatch "\.ph(p[3457]?|t|tml)$">
+    Require all denied
+</FilesMatch>

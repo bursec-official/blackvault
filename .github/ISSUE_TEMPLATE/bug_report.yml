@@ -1,0 +1,40 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! For **security problems**, please use private reporting instead (Security tab → Report a vulnerability).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Black Vault version
+      description: Run `cat VERSION` in the folder you installed from.
+      placeholder: 2.4.0
+    validations:
+      required: true
+  - type: input
+    id: ubuntu
+    attributes:
+      label: Ubuntu and PHP versions
+      description: "`lsb_release -d` and `php -v`"
+      placeholder: Ubuntu 24.04.1 LTS, PHP 8.3.6
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and device
+      placeholder: Firefox 140 on Windows 11
+  - type: textarea
+    id: logs
+    attributes:
+      label: Installer output or error messages
+      description: Remove IP addresses or names you'd rather keep private.
+      render: text

@@ -1,0 +1,33 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PHP syntax
+        run: |
+          php -v | head -1
+          find . -name '*.php' -print0 | xargs -0 -n1 php -l
+          php -l tools/blackvault-disk
+
+      - name: JavaScript syntax
+        run: for f in $(find . -name '*.js'); do node --check "$f"; done
+
+      - name: Shell syntax
+        run: for f in install.sh tools/blackvault-tls; do bash -n "$f"; done
+
+      - name: No real password hashes committed
+        run: |
+          # Only the fixed timing-dummy hashes may appear in the code
+          if grep -rnE '\$2y\$[0-9]{2}\$[./A-Za-z0-9]{53}' --include='*.php' . | grep -v 'DUMMY_HASH'; then
+            echo "A password hash was committed. Remove it." && exit 1
+          fi

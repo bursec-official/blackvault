@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# =====================================================================
+#  Black Vault — HTTPS certificates (installed as /usr/local/sbin/blackvault-tls)
+#
+#    sudo blackvault-tls setup     create the local CA (once) and the server certificate
+#    sudo blackvault-tls renew     renew the server certificate if needed (daily timer)
+#    sudo blackvault-tls show      fingerprint, expiry and where to download the CA
+#    sudo blackvault-tls new-ca    start over with a new CA (devices must install it again)
+#
+#  How it works:
+#   - A private certificate authority (CA) lives in /etc/blackvault/tls (root only).
+#     You install ca.crt once on each device; from then on the browser shows
+#     the padlock and everything travels encrypted.
+#   - The CA carries NAME CONSTRAINTS: it can only vouch for this server's own
+#     names and exact IP addresses. Even if someone stole its key, it would be
+#     useless against any other website (banks, Google…) or device.
+#     Give the server a fixed IP (DHCP reservation in your router).
+#   - The server certificate lasts 397 days and renews itself 30 days before
+#     it expires, or as soon as the server gets a new IP.
+# =====================================================================
+set -Eeuo pipefail
+umask 077
+
+TLS_DIR="${BV_TLS_DIR:-/etc/blackvault/tls}"
+PUB_DIR="${BV_PUBLIC_DIR:-/var/www/blackvault-public}"
+CA_DAYS=3650
+SRV_DAYS=397
+RENEW_BEFORE=$((30 * 86400))
+
+die() { printf '✘ %s\n' "$*" >&2; exit 1; }
+say() { [[ "${QUIET:-0}" == "1" ]] || printf '%s\n' "$*"; }
+
+[[ $EUID -eq 0 || -n "${BV_TLS_DIR:-}" ]] || exec sudo "$0" "$@"
+command -v openssl >/dev/null || die "openssl is not installed (sudo apt install openssl)."
+
+HOST="$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')"
+[[ "$HOST" =~ ^[a-z0-9][a-z0-9-]*$ ]] || HOST="blackvault"
+NAMES=("$HOST" "$HOST.local" "$HOST.lan" "$HOST.home.arpa")
+
+# ---------------------------------------------------------------- IPv4 helpers
+ip2int() { local IFS=.; read -r a b c d <<<"$1"; echo $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+int2ip() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+mask_of() { echo $(( $1 == 0 ? 0 : (0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF )); }
+
+# Global IPv4 addresses of this machine as "ip/prefix" (LAN, Wi-Fi, Tailscale…)
+current_cidrs() {
+    if [[ -n "${BV_TLS_FAKE_CIDRS:-}" ]]; then tr ' ' '\n' <<<"$BV_TLS_FAKE_CIDRS"; return; fi
+    ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'
+}
+current_ips() { current_cidrs | cut -d/ -f1; echo 127.0.0.1; }
+
+# Is this IP inside the networks the CA was made for?
+ip_permitted() {
+    local ip n net bits m
+    n="$(ip2int "$1")"
+    while read -r net bits; do
+        [[ -n "$net" ]] || continue
+        m="$(mask_of "$bits")"
+        (( (n & m) == ($(ip2int "$net") & m) )) && return 0
+    done < "$TLS_DIR/ca.nets"
+    return 1
+}
+
+# Is this host name one the CA was made for? (the host name may change after install)
+name_permitted() {
+    [[ -f "$TLS_DIR/ca.cnf" ]] || return 0
+    awk -v n="$1" -F' = ' '$1 ~ /^permitted;DNS\./ && $2 == n { f = 1 } END { exit !f }' "$TLS_DIR/ca.cnf"
+}
+
+# ---------------------------------------------------------------- CA
+make_ca() {
+    mkdir -p "$TLS_DIR"; chmod 700 "$TLS_DIR"
+    local cnf="$TLS_DIR/ca.cnf" i=0 cidr ip bits m
+    : > "$TLS_DIR/ca.nets"
+    {
+        echo "[req]"; echo "distinguished_name = dn"; echo "prompt = no"
+        echo "[dn]"; echo "CN = Black Vault local CA ($HOST)"; echo "O = Black Vault"
+        echo "[v3_ca]"
+        echo "basicConstraints = critical, CA:TRUE, pathlen:0"
+        echo "keyUsage = critical, keyCertSign, cRLSign"
+        echo "subjectKeyIdentifier = hash"
+        echo "nameConstraints = critical, @nc"
+        echo "[nc]"
+        # Only this server's exact addresses (/32): the CA cannot vouch for any
+        # other device on your network, not even your router.
+        for cidr in $(current_ips | sort -u); do
+            ip="$cidr"; bits=32
+            m="$(mask_of "$bits")"
+            local net; net="$(int2ip $(( $(ip2int "$ip") & m )))"
+            grep -qx "$net $bits" "$TLS_DIR/ca.nets" && continue
+            echo "$net $bits" >> "$TLS_DIR/ca.nets"
+            echo "permitted;IP.$i = $net/$(int2ip "$m")"; i=$((i + 1))
+        done
+        i=0
+        for n in "${NAMES[@]}"; do echo "permitted;DNS.$i = $n"; i=$((i + 1)); done
+    } > "$cnf"
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$TLS_DIR/ca.key" 2>/dev/null
+    openssl req -x509 -new -key "$TLS_DIR/ca.key" -sha256 -days "$CA_DAYS" \
+        -config "$cnf" -extensions v3_ca -out "$TLS_DIR/ca.crt"
+    chmod 600 "$TLS_DIR/ca.key"; chmod 644 "$TLS_DIR/ca.crt"
+    rm -f "$TLS_DIR/server.crt"           # a new CA needs a new server certificate
+    say "  New local CA created (valid 10 years, limited to: $(awk '{printf "%s/%s ", $1, $2}' "$TLS_DIR/ca.nets")${NAMES[*]})"
+}
+
+# ---------------------------------------------------------------- server certificate
+wanted_sans() {
+    local ip out=() skipped=()
+    for ip in $(current_ips | sort -u); do
+        if ip_permitted "$ip"; then out+=("IP:$ip"); else skipped+=("$ip"); fi
+    done
+    for n in "${NAMES[@]}"; do
+        if name_permitted "$n"; then out+=("DNS:$n"); else skipped+=("$n"); fi
+    done
+    (( ${#skipped[@]} )) && echo "SKIPPED ${skipped[*]}" >&2
+    printf '%s\n' "${out[@]}"
+}
+
+needs_server_cert() {
+    [[ -s "$TLS_DIR/server.crt" && -s "$TLS_DIR/server.key" ]] || return 0
+    openssl x509 -checkend "$RENEW_BEFORE" -noout -in "$TLS_DIR/server.crt" >/dev/null || return 0
+    [[ "$(wanted_sans 2>/dev/null)" == "$(cat "$TLS_DIR/server.sans" 2>/dev/null)" ]] || return 0
+    openssl verify -CAfile "$TLS_DIR/ca.crt" "$TLS_DIR/server.crt" >/dev/null 2>&1 || return 0
+    return 1
+}
+
+make_server_cert() {
+    local sans ext skipped
+    sans="$(wanted_sans 2>"$TLS_DIR/.skipped")"
+    skipped="$(sed 's/^SKIPPED //' "$TLS_DIR/.skipped")"; rm -f "$TLS_DIR/.skipped"
+    ext="$TLS_DIR/server.ext"
+    {
+        echo "[v3_srv]"
+        echo "basicConstraints = critical, CA:FALSE"
+        echo "keyUsage = critical, digitalSignature"
+        echo "extendedKeyUsage = serverAuth"
+        echo "subjectKeyIdentifier = hash"
+        echo "authorityKeyIdentifier = keyid"
+        echo "subjectAltName = $(paste -sd, <<<"$sans")"
+    } > "$ext"
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$TLS_DIR/server.key.new" 2>/dev/null
+    # The subject name must also be one the CA may vouch for (browsers only
+    # read the alternative names; without a usable host name, no CN at all)
+    local cn subj; cn="$(grep -m1 '^DNS:' <<<"$sans" | cut -d: -f2 || true)"
+    if [[ -n "$cn" ]]; then subj="/CN=$cn"; else subj="/O=Black Vault"; fi
+    openssl req -new -key "$TLS_DIR/server.key.new" -subj "$subj" -out "$TLS_DIR/server.csr" 2>/dev/null
+    openssl x509 -req -in "$TLS_DIR/server.csr" -CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" \
+        -set_serial "0x$(openssl rand -hex 16)" -days "$SRV_DAYS" -sha256 \
+        -extfile "$ext" -extensions v3_srv -out "$TLS_DIR/server.crt.new" 2>/dev/null
+    openssl verify -CAfile "$TLS_DIR/ca.crt" "$TLS_DIR/server.crt.new" >/dev/null || die "The new certificate does not verify; nothing was changed."
+    chmod 600 "$TLS_DIR/server.key.new"; chmod 644 "$TLS_DIR/server.crt.new"
+    mv -f "$TLS_DIR/server.key.new" "$TLS_DIR/server.key"
+    mv -f "$TLS_DIR/server.crt.new" "$TLS_DIR/server.crt"
+    printf '%s\n' "$sans" > "$TLS_DIR/server.sans"
+    rm -f "$TLS_DIR/server.csr"
+    say "  Server certificate issued for: $(paste -sd' ' <<<"$sans" | sed 's/IP://g; s/DNS://g') (valid $SRV_DAYS days, renews itself)"
+    if [[ -n "$skipped" ]]; then
+        say "  ! This server now also has $skipped, which the CA was not made for."
+        say "    To use HTTPS on that address: sudo blackvault-tls new-ca  (then install the new CA on your devices)"
+    fi
+}
+
+publish_ca() {
+    mkdir -p "$PUB_DIR"; chmod 755 "$PUB_DIR"
+    install -m 644 "$TLS_DIR/ca.crt" "$PUB_DIR/blackvault-ca.crt"
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && home="$(getent passwd "$SUDO_USER" | cut -d: -f6)" && [[ -d "$home" ]]; then
+        install -m 644 -o "$SUDO_USER" "$TLS_DIR/ca.crt" "$home/blackvault-ca.crt" 2>/dev/null || true
+    fi
+}
+
+fingerprint() { openssl x509 -noout -fingerprint -sha256 -in "$TLS_DIR/ca.crt" | cut -d= -f2; }
+
+reload_apache() {
+    if command -v systemctl >/dev/null && systemctl is-active --quiet apache2 2>/dev/null; then
+        systemctl reload apache2 && say "  Apache reloaded with the new certificate"
+    fi
+}
+
+cmd="${1:-show}"
+case "$cmd" in
+setup|renew)
+    [[ "$cmd" == "renew" ]] && QUIET=1
+    if [[ ! -s "$TLS_DIR/ca.key" || ! -s "$TLS_DIR/ca.crt" || ! -s "$TLS_DIR/ca.nets" ]]; then make_ca; fi
+    if needs_server_cert; then
+        make_server_cert
+        [[ "$cmd" == "renew" ]] && { QUIET=0; reload_apache; }
+    else
+        say "  Server certificate is valid until $(openssl x509 -noout -enddate -in "$TLS_DIR/server.crt" | cut -d= -f2)"
+        out="$(wanted_sans 2>&1 >/dev/null || true)"
+        [[ -n "$out" ]] && say "  ! This server also has ${out#SKIPPED }, which the CA does not cover. To use HTTPS there: sudo blackvault-tls new-ca"
+    fi
+    publish_ca
+    ;;
+show)
+    [[ -s "$TLS_DIR/ca.crt" ]] || die "HTTPS is not set up yet. Run: sudo blackvault-tls setup"
+    IP="$(current_ips | awk 'NR == 1')"
+    echo "Black Vault HTTPS"
+    echo "  CA fingerprint (SHA-256): $(fingerprint)"
+    echo "  CA valid until:           $(openssl x509 -noout -enddate -in "$TLS_DIR/ca.crt" | cut -d= -f2)"
+    echo "  Server cert valid until:  $(openssl x509 -noout -enddate -in "$TLS_DIR/server.crt" | cut -d= -f2)"
+    echo "  Server cert names:        $(paste -sd' ' "$TLS_DIR/server.sans" | sed 's/IP://g; s/DNS://g')"
+    echo "  Download the CA on each device:  http://$IP/blackvault-ca.crt"
+    ;;
+new-ca)
+    [[ "${2:-}" == "--yes" ]] || die "This replaces the CA: every device must install the new one. Confirm with: sudo blackvault-tls new-ca --yes"
+    [[ -d "$TLS_DIR" ]] && cp -a "$TLS_DIR" "$TLS_DIR.old-$(date +%Y%m%d-%H%M%S)"
+    rm -f "$TLS_DIR/ca.key" "$TLS_DIR/ca.crt" "$TLS_DIR/ca.nets"
+    make_ca; make_server_cert; publish_ca; reload_apache
+    echo "  New CA fingerprint (SHA-256): $(fingerprint)"
+    ;;
+fingerprint)
+    fingerprint
+    ;;
+*)
+    sed -n '3,8p' "$0"; exit 1 ;;
+esac

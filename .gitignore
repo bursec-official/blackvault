@@ -1,0 +1,17 @@
+# Data created on a server: never commit it
+minidrive/storage/*
+!minidrive/storage/.htaccess
+!minidrive/storage/.gitkeep
+minidrive/state/
+sysmonitor/state/*
+!sysmonitor/state/.htaccess
+!sysmonitor/state/.gitkeep
+
+# System and editor files
+.DS_Store
+._*
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.log

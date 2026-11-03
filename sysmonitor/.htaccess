@@ -1,0 +1,13 @@
+# SysMonitor - protecciones a nivel de Apache
+Options -Indexes
+
+<FilesMatch "^(config\.php|README\.md)$">
+    Require all denied
+</FilesMatch>
+
+<IfModule mod_php.c>
+    php_flag session.upload_progress.enabled off
+    php_flag session.cookie_httponly on
+    php_value session.cookie_samesite Lax
+    php_flag session.use_strict_mode on
+</IfModule>

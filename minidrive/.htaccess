@@ -1,0 +1,27 @@
+# MiniDrive - protecciones y configuración a nivel de Apache (raíz de la app)
+Options -Indexes
+
+# Los archivos internos nunca se sirven directamente
+<FilesMatch "^(config\.php|README\.md|install\.sh)$">
+    Require all denied
+</FilesMatch>
+
+# Límites de subida: 20 GB por archivo, con margen de tiempo para redes lentas.
+# Esto solo funciona con mod_php (Apache clásico). Si tu servidor usa PHP-FPM,
+# estos valores se ignoran y hay que ponerlos en el pool de PHP-FPM en su lugar.
+<IfModule mod_php.c>
+    php_value upload_max_filesize 20480M
+    php_value post_max_size 20480M
+    php_value max_execution_time 3600
+    php_value max_input_time 3600
+    php_value memory_limit 20480M
+    # MiniDrive no usa esta función de PHP; desactivarla reduce superficie de
+    # ataque (fue uno de los caminos de la vulnerabilidad PHP2Shell, oct. 2026).
+    php_flag session.upload_progress.enabled off
+    php_flag session.cookie_httponly on
+    php_value session.cookie_samesite Lax
+    php_flag session.use_strict_mode on
+    # Las descargas se envían por trozos: sin compresión ni buffers intermedios.
+    php_flag zlib.output_compression off
+    php_value output_buffering 0
+</IfModule>

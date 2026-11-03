@@ -1,0 +1,799 @@
+#!/usr/bin/env php
+<?php
+/**
+ * =====================================================================
+ *  Black Vault — disk service  (installed as /usr/local/sbin/blackvault-disk)
+ *
+ *  Runs as ROOT, outside the web server, started by systemd for each request
+ *  that arrives on /run/blackvault-disk.sock (socket mode 0660, group
+ *  www-data: only the web apps and root can talk to it).
+ *
+ *  The web never gets root. It can only ask for these actions:
+ *     list        disks, their role and health
+ *     smart       disk health (cached; never wakes up a sleeping disk)
+ *     format      erase a disk and prepare it for Black Vault (ext4)
+ *     connect     mount a Black Vault disk at /srv/blackvault/disks/<uuid>
+ *     eject       unmount a Black Vault disk so it can be unplugged
+ *     move        copy all drives to another disk, verify, then switch
+ *     remove_old  delete the old copy left behind after a move
+ *     status      where the drives live and how a move is going
+ *
+ *  Safety rules (enforced here, whatever the web asks):
+ *   - Every value is validated; commands never go through a shell.
+ *   - A disk with ANYTHING of the system on it (/, /boot, swap, LVM, RAID,
+ *     encrypted volumes…) is never formatted, mounted or ejected.
+ *   - A disk is only formatted if the request carries its exact identity
+ *     (path + serial + size + model), so a different disk plugged into the
+ *     same /dev/sdX in the meantime is never touched.
+ *   - Black Vault disks are mounted with nodev,nosuid,noexec: nothing on
+ *     them can ever run as a program or become a device.
+ *   - File copies run as www-data, never as root.
+ *   - The disk holding the drives is never ejected or formatted.
+ *   - storage.json (where the drives live) is written only by this program.
+ *
+ *  From the terminal (root):  blackvault-disk list | smart | status
+ * =====================================================================
+ */
+declare(strict_types=1);
+if (PHP_SAPI !== 'cli') { exit(1); }
+error_reporting(E_ALL);
+ini_set('display_errors', 'stderr');
+umask(022);
+
+// Test harness only (never set by systemd): loop devices, other paths.
+$TEST = getenv('BV_DISK_TEST') === '1';
+define('T', $TEST);
+define('CONF_DIR',    T && getenv('BV_T_CONF')  ? getenv('BV_T_CONF')  : '/etc/blackvault');
+define('STATE_DIR',   T && getenv('BV_T_STATE') ? getenv('BV_T_STATE') : '/var/lib/blackvault');
+define('DISKS_DIR',   T && getenv('BV_T_DISKS') ? getenv('BV_T_DISKS') : '/srv/blackvault/disks');
+define('FSTAB',       T && getenv('BV_T_FSTAB') ? getenv('BV_T_FSTAB') : '/etc/fstab');
+define('STORAGE_CONF', CONF_DIR . '/storage.json');
+define('MOVE_STATUS',  STATE_DIR . '/move.json');
+define('SMART_CACHE',  STATE_DIR . '/smart.json');
+define('LOCK_FILE',    T ? STATE_DIR . '/disk.lock' : '/run/blackvault-disk.lock');
+define('WEB_USER',     'www-data');
+define('FS_LABEL',     'BLACKVAULT');
+define('MOUNT_OPTS',   'nodev,nosuid,noexec,noatime');
+const UUID_RE = '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/';
+const DEV_RE  = '#^/dev/(sd[a-z]{1,2}|nvme[0-9]+n[0-9]+|vd[a-z]{1,2}|xvd[a-z]{1,2}|mmcblk[0-9]+|loop[0-9]+)$#';
+const ID_RE   = '/^[a-f0-9]{16}$/';
+putenv('PATH=/usr/sbin:/usr/bin:/sbin:/bin');
+putenv('LC_ALL=C');
+
+/* ===================================================================== */
+/*  Small helpers                                                         */
+/* ===================================================================== */
+
+final class Refused extends RuntimeException {}
+function refuse(string $msg): void { throw new Refused($msg); }
+
+/** Runs a command (array form: no shell). Returns [exit code, stdout, stderr]. */
+function run(array $cmd, ?string $stdin = null, int $timeout = 120): array {
+    $spec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $p = @proc_open($cmd, $spec, $pipes);
+    if (!is_resource($p)) return [127, '', 'cannot run ' . $cmd[0]];
+    if ($stdin !== null) fwrite($pipes[0], $stdin);
+    fclose($pipes[0]);
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    $out = $err = '';
+    $end = time() + $timeout;
+    while (true) {
+        $r = [$pipes[1], $pipes[2]]; $w = $e = null;
+        if (@stream_select($r, $w, $e, 1) === false) break;
+        foreach ($r as $s) { $chunk = fread($s, 65536); if ($s === $pipes[1]) $out .= $chunk; else $err .= $chunk; }
+        $st = proc_get_status($p);
+        if (!$st['running']) { $out .= stream_get_contents($pipes[1]); $err .= stream_get_contents($pipes[2]); break; }
+        if (time() > $end) { proc_terminate($p, 9); $err .= "\ntimed out"; break; }
+    }
+    fclose($pipes[1]); fclose($pipes[2]);
+    $code = proc_close($p);
+    if (isset($st) && !$st['running'] && $st['exitcode'] !== -1) $code = $st['exitcode'];
+    return [$code, $out, $err];
+}
+
+function must(array $cmd, string $what, ?string $stdin = null, int $timeout = 300): string {
+    [$c, $o, $e] = run($cmd, $stdin, $timeout);
+    if ($c !== 0) refuse($what . ' failed: ' . trim(substr($e ?: $o, 0, 300)));
+    return $o;
+}
+
+function read_json(string $file): ?array {
+    $d = is_file($file) ? json_decode((string)@file_get_contents($file), true) : null;
+    return is_array($d) ? $d : null;
+}
+
+/** Atomic write, readable by the web (it never contains secrets). */
+function write_json(string $file, array $data): void {
+    $dir = dirname($file);
+    if (!is_dir($dir)) mkdir($dir, 0755, true);
+    $tmp = $file . '.tmp' . getmypid();
+    file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    chmod($tmp, 0644);
+    rename($tmp, $file);
+}
+
+function with_lock(callable $fn) {
+    $dir = dirname(LOCK_FILE);
+    if (!is_dir($dir)) mkdir($dir, 0755, true);
+    $fp = fopen(LOCK_FILE, 'c');
+    if (!flock($fp, LOCK_EX | LOCK_NB)) {
+        // Another change is in progress: wait a little, never forever
+        $t = time() + 20;
+        while (!flock($fp, LOCK_EX | LOCK_NB)) { if (time() > $t) refuse('Another disk operation is in progress. Try again in a moment.'); usleep(250000); }
+    }
+    try { return $fn(); } finally { flock($fp, LOCK_UN); fclose($fp); }
+}
+
+function web_ids(): array {
+    $pw = posix_getpwnam(WEB_USER);
+    if (!$pw) refuse('System user ' . WEB_USER . ' not found.');
+    return [(int)$pw['uid'], (int)$pw['gid']];
+}
+
+function human(float $b): string {
+    $u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']; $i = 0;
+    while ($b >= 1024 && $i < 5) { $b /= 1024; $i++; }
+    return ($i ? number_format($b, $b < 10 ? 1 : 0) : (string)(int)$b) . ' ' . $u[$i];
+}
+
+/* ===================================================================== */
+/*  Where the drives live                                                 */
+/* ===================================================================== */
+
+function storage_conf(): array {
+    $c = read_json(STORAGE_CONF) ?? [];
+    $c += ['internal' => '/var/www/minidrive/storage', 'active' => 'internal', 'disks' => []];
+    if (!is_array($c['disks'])) $c['disks'] = [];
+    if ($c['active'] !== 'internal' && !preg_match(UUID_RE, (string)$c['active'])) $c['active'] = 'internal';
+    return $c;
+}
+
+function mountpoint_of(string $uuid): string { return DISKS_DIR . '/' . $uuid; }
+
+/** Storage folder for 'internal' or a disk UUID. */
+function location_path(string $loc): string {
+    if ($loc === 'internal') return rtrim((string)storage_conf()['internal'], '/');
+    if (!preg_match(UUID_RE, $loc)) refuse('Invalid disk.');
+    return mountpoint_of($loc) . '/storage';
+}
+
+/** Is that Black Vault disk mounted at its place, with its marker? */
+function disk_ready(string $uuid): bool {
+    $mp = mountpoint_of($uuid);
+    if (!is_mounted_at($mp)) return false;
+    $m = read_json($mp . '/.blackvault-disk');
+    return $m && ($m['uuid'] ?? '') === $uuid && is_dir($mp . '/storage');
+}
+
+/* ===================================================================== */
+/*  Mounts and block devices                                              */
+/* ===================================================================== */
+
+/** [target => source] from the kernel's own mount table. */
+function mounts(): array {
+    $out = [];
+    foreach (@file('/proc/self/mountinfo', FILE_IGNORE_NEW_LINES) ?: [] as $l) {
+        $parts = explode(' - ', $l, 2);
+        $a = explode(' ', $parts[0]);
+        $b = explode(' ', $parts[1] ?? '');
+        $target = stripcslashes(str_replace('\040', ' ', $a[4] ?? ''));
+        $out[$target] = $b[1] ?? '';
+    }
+    return $out;
+}
+function is_mounted_at(string $path): bool { return array_key_exists($path, mounts()); }
+
+function active_swaps(): array {
+    $s = [];
+    foreach (array_slice(@file('/proc/swaps', FILE_IGNORE_NEW_LINES) ?: [], 1) as $l) { $s[] = preg_split('/\s+/', trim($l))[0]; }
+    return $s;
+}
+
+/** The whole block-device tree from lsblk (sizes in bytes). */
+function lsblk_tree(): array {
+    $cols = 'NAME,KNAME,PATH,TYPE,SIZE,MODEL,VENDOR,SERIAL,WWN,TRAN,RM,HOTPLUG,RO,FSTYPE,LABEL,UUID,MOUNTPOINTS,ROTA';
+    [$c, $o] = run(['lsblk', '-J', '-b', '-o', $cols]);
+    if ($c !== 0) {   // older lsblk: MOUNTPOINT (singular)
+        [$c, $o] = run(['lsblk', '-J', '-b', '-o', str_replace('MOUNTPOINTS', 'MOUNTPOINT', $cols)]);
+    }
+    $d = json_decode($o, true);
+    $tree = is_array($d['blockdevices'] ?? null) ? $d['blockdevices'] : [];
+    foreach ($tree as &$n) fill_fs($n);
+    return $tree;
+}
+
+/**
+ * lsblk takes filesystem details from udev, which can lag right after a
+ * format (or be missing). Ask the device itself when they are missing.
+ */
+function fill_fs(array &$n): void {
+    $isLeaf = empty($n['children']);
+    if (empty($n['fstype']) && $isLeaf && in_array($n['type'] ?? '', ['part', 'disk', 'loop'], true) && preg_match('#^/dev/[a-z0-9]+$#', (string)($n['path'] ?? ''))) {
+        [$c, $o] = run(['blkid', '-p', '-o', 'export', (string)$n['path']], null, 20);
+        if ($c === 0) {
+            foreach (explode("\n", $o) as $l) {
+                if (strpos($l, '=') === false) continue;
+                [$k, $v] = explode('=', $l, 2);
+                if ($k === 'TYPE') $n['fstype'] = $v;
+                elseif ($k === 'LABEL') $n['label'] = $v;
+                elseif ($k === 'UUID') $n['uuid'] = $v;
+            }
+        }
+    }
+    if (!empty($n['children'])) foreach ($n['children'] as &$ch) fill_fs($ch);
+}
+
+function node_mounts(array $n): array {
+    $m = $n['mountpoints'] ?? (isset($n['mountpoint']) ? [$n['mountpoint']] : []);
+    return array_values(array_filter((array)$m, fn($x) => is_string($x) && $x !== ''));
+}
+
+/** Flatten a device and all its descendants. */
+function descendants(array $n): array {
+    $all = [$n];
+    foreach ($n['children'] ?? [] as $ch) $all = array_merge($all, descendants($ch));
+    return $all;
+}
+
+function disk_identity(array $n): string {
+    return substr(hash('sha256', implode('|', [$n['path'] ?? '', trim((string)($n['serial'] ?? '')), trim((string)($n['wwn'] ?? '')), (string)($n['size'] ?? 0), trim((string)($n['model'] ?? ''))])), 0, 16);
+}
+
+/** Physical disks Black Vault may show. Loop devices only in the test harness. */
+function physical_disks(): array {
+    $out = [];
+    foreach (lsblk_tree() as $n) {
+        $type = $n['type'] ?? '';
+        $name = (string)($n['name'] ?? '');
+        if ((int)($n['size'] ?? 0) <= 0) continue;
+        if ($type === 'disk' && !preg_match('/^(zram|ram|md|dm-|sr)/', $name)) { $out[] = $n; continue; }
+        if (T && $type === 'loop') {
+            // only the harness' own image files
+            $bf = trim((string)@file_get_contents('/sys/block/' . $name . '/loop/backing_file'));
+            if ($bf !== '' && strpos($bf, (string)getenv('BV_T_IMAGES')) === 0) $out[] = $n;
+        }
+    }
+    return $out;
+}
+
+/** Everything we need to decide what may be done with a disk. */
+function describe(array $n, array $conf): array {
+    $nodes = descendants($n);
+    $swaps = active_swaps();
+    $sysReasons = [];
+    $bvPart = null;
+    $parts = [];
+    foreach ($nodes as $i => $x) {
+        $fs = (string)($x['fstype'] ?? '');
+        foreach (node_mounts($x) as $mp) {
+            if (strpos($mp . '/', DISKS_DIR . '/') !== 0) $sysReasons[] = 'mounted at ' . $mp;
+        }
+        if (in_array($x['path'] ?? '', $swaps, true) || $fs === 'swap') $sysReasons[] = 'swap';
+        if (in_array($fs, ['LVM2_member', 'linux_raid_member', 'crypto_LUKS', 'zfs_member', 'bcache', 'ceph'], true)) $sysReasons[] = $fs;
+        if ($i === 0) continue;
+        if (($x['type'] ?? '') === 'part') {
+            $parts[] = [
+                'path' => (string)$x['path'], 'size' => (int)$x['size'], 'fstype' => $fs ?: null,
+                'label' => $x['label'] ?? null, 'uuid' => $x['uuid'] ?? null, 'mounted' => node_mounts($x),
+            ];
+            if ($fs === 'ext4' && ($x['label'] ?? '') === FS_LABEL && preg_match(UUID_RE, (string)($x['uuid'] ?? ''))) $bvPart = $x;
+        }
+    }
+    $sysReasons = array_values(array_unique($sysReasons));
+    // Does the internal drives folder live on this disk?
+    static $internalSrc = null;
+    if ($internalSrc === null) {
+        [, $o] = run(['findmnt', '-n', '-o', 'SOURCE', '--target', (string)$conf['internal']], null, 10);
+        $internalSrc = trim($o);
+    }
+    $hasInternal = false;
+    foreach ($nodes as $x) if ($internalSrc !== '' && ($x['path'] ?? '') === $internalSrc) $hasInternal = true;
+
+    $d = [
+        'id' => disk_identity($n),
+        'path' => (string)$n['path'],
+        'name' => (string)$n['name'],
+        'model' => trim((string)($n['model'] ?? '')) ?: (trim((string)($n['vendor'] ?? '')) ?: 'Disk'),
+        'serial' => trim((string)($n['serial'] ?? '')) ?: null,
+        'size' => (int)$n['size'],
+        'transport' => $n['tran'] ?? ($n['type'] === 'loop' ? 'loop' : null),
+        'removable' => (bool)($n['rm'] ?? false) || (bool)($n['hotplug'] ?? false) || ($n['tran'] ?? '') === 'usb',
+        'rotational' => (bool)($n['rota'] ?? false),
+        'partitions' => $parts,
+        'protected' => (bool)$sysReasons || (bool)($n['ro'] ?? false),
+        'reason' => $sysReasons ? 'Used by the system (' . implode(', ', array_slice($sysReasons, 0, 3)) . ')' : (($n['ro'] ?? false) ? 'Read-only' : null),
+        'role' => 'empty',
+        'bv' => null,
+        'internal' => $hasInternal,
+    ];
+    if ($sysReasons) {
+        $d['role'] = 'system';
+        // The internal storage folder lives on the system disk
+        if ($conf['active'] === 'internal' && $hasInternal) $d['holds_drives'] = true;
+    } elseif ($bvPart) {
+        $uuid = (string)$bvPart['uuid'];
+        $mp = mountpoint_of($uuid);
+        $ready = disk_ready($uuid);
+        $d['role'] = $conf['active'] === $uuid ? 'storage' : 'blackvault';
+        $d['bv'] = [
+            'uuid' => $uuid,
+            'connected' => $ready,
+            'total' => $ready ? (float)@disk_total_space($mp) : null,
+            'free' => $ready ? (float)@disk_free_space($mp) : null,
+            'has_drives' => $ready && is_dir($mp . '/storage/users') && count(@scandir($mp . '/storage/users') ?: []) > 2,
+            'active' => $conf['active'] === $uuid,
+        ];
+    } elseif ($parts || array_filter($nodes, fn($x) => !empty($x['fstype']))) {
+        $d['role'] = 'other';
+        $d['formats'] = array_values(array_unique(array_filter(array_map(fn($x) => $x['fstype'] ?? null, $nodes))));
+    }
+    return $d;
+}
+
+function find_disk(string $path, ?string $id = null): array {
+    if (!preg_match(DEV_RE, $path)) refuse('Invalid disk.');
+    $conf = storage_conf();
+    foreach (physical_disks() as $n) {
+        if (($n['path'] ?? '') !== $path) continue;
+        $d = describe($n, $conf);
+        if ($id !== null && !hash_equals($d['id'], $id)) refuse('That disk changed (was it unplugged?). Look at the list again.');
+        return $d;
+    }
+    refuse('Disk not found. Is it plugged in?');
+}
+
+/** The partition of a Black Vault disk, by filesystem UUID. */
+function find_bv_partition(string $uuid): ?array {
+    foreach (physical_disks() as $n) {
+        $nodes = descendants($n);
+        foreach ($nodes as $x) {
+            if (($x['uuid'] ?? '') === $uuid) {
+                $desc = describe($n, storage_conf());
+                if ($desc['role'] === 'system') refuse('That disk is used by the system.');
+                if (($x['fstype'] ?? '') !== 'ext4' || ($x['label'] ?? '') !== FS_LABEL) refuse('Not a Black Vault disk.');
+                return ['part' => (string)$x['path'], 'disk' => $desc];
+            }
+        }
+    }
+    return null;
+}
+
+/* ===================================================================== */
+/*  fstab: so the disk comes back by itself after a restart               */
+/* ===================================================================== */
+
+function fstab_set(string $uuid, bool $present): void {
+    $lines = is_file(FSTAB) ? file(FSTAB, FILE_IGNORE_NEW_LINES) : [];
+    $keep = array_values(array_filter($lines, fn($l) => strpos($l, 'UUID=' . $uuid . ' ') !== 0));
+    if ($present) {
+        $keep[] = 'UUID=' . $uuid . ' ' . mountpoint_of($uuid) . ' ext4 ' . MOUNT_OPTS . ',nofail,x-systemd.device-timeout=10s 0 2  # blackvault';
+    }
+    if ($keep === $lines) return;
+    if (is_file(FSTAB) && !is_file(FSTAB . '.blackvault-backup')) copy(FSTAB, FSTAB . '.blackvault-backup');
+    $tmp = FSTAB . '.tmp' . getmypid();
+    file_put_contents($tmp, implode("\n", $keep) . "\n");
+    chmod($tmp, 0644);
+    rename($tmp, FSTAB);
+    if (!T && is_dir('/run/systemd/system')) run(['systemctl', 'daemon-reload'], null, 30);
+}
+
+/* ===================================================================== */
+/*  Actions                                                              */
+/* ===================================================================== */
+
+function act_list(): array {
+    $conf = storage_conf();
+    $smart = act_smart([])['disks'] ?? [];           // cached for 10 minutes
+    $disks = [];
+    foreach (physical_disks() as $n) {
+        $d = describe($n, $conf);
+        $d['health'] = $smart[$d['path']] ?? null;
+        $disks[] = $d;
+    }
+    // Black Vault disks we know about but that are not plugged in
+    $missing = [];
+    foreach ($conf['disks'] as $uuid => $info) {
+        $seen = false;
+        foreach ($disks as $d) if (($d['bv']['uuid'] ?? '') === $uuid) $seen = true;
+        if (!$seen && preg_match(UUID_RE, (string)$uuid)) {
+            $missing[] = ['uuid' => $uuid, 'model' => $info['model'] ?? 'Disk', 'size' => $info['size'] ?? null, 'active' => $conf['active'] === $uuid];
+        }
+    }
+    $internal = $conf['internal'];
+    return [
+        'disks' => $disks,
+        'missing' => $missing,
+        'storage' => [
+            'active' => $conf['active'],
+            'internal' => ['total' => (float)@disk_total_space($internal), 'free' => (float)@disk_free_space($internal)],
+        ],
+        'move' => move_status(),
+        'smart_tool' => is_executable('/usr/sbin/smartctl') || is_executable('/usr/bin/smartctl'),
+    ];
+}
+
+function act_status(): array {
+    $conf = storage_conf();
+    $ready = $conf['active'] === 'internal' ? true : disk_ready($conf['active']);
+    return ['storage' => ['active' => $conf['active'], 'ready' => $ready], 'move' => move_status()];
+}
+
+function act_format(array $r): array {
+    $path = (string)($r['path'] ?? '');
+    $id = (string)($r['id'] ?? '');
+    if (!preg_match(ID_RE, $id)) refuse('Invalid disk.');
+    if (($r['confirm'] ?? '') !== 'ERASE') refuse('Not confirmed.');
+    return with_lock(function () use ($path, $id) {
+        $mv = move_status();
+        if ($mv && in_array($mv['state'], ['running', 'verifying'], true)) refuse('Drives are being moved. Wait until it finishes.');
+        $d = find_disk($path, $id);
+        if ($d['protected']) refuse('This disk is used by the system and cannot be erased.');
+        if ($d['role'] === 'storage') refuse('This disk holds the drives. Move the drives to another disk first.');
+        foreach ($d['partitions'] as $p) if ($p['mounted']) refuse('A part of this disk is in use. Eject it first.');
+        $conf = storage_conf();
+        if (($d['bv']['uuid'] ?? null) && $d['bv']['uuid'] === $conf['active']) refuse('This disk holds the drives.');
+
+        // Forget it if it was a Black Vault disk before
+        if ($d['bv']) { fstab_set($d['bv']['uuid'], false); unset($conf['disks'][$d['bv']['uuid']]); write_json(STORAGE_CONF, $conf); }
+
+        foreach ($d['partitions'] as $p) run(['wipefs', '-a', '-q', $p['path']], null, 60);
+        must(['wipefs', '-a', '-q', $path], 'Erasing');
+        must(['sfdisk', '-q', '--wipe', 'always', '--wipe-partitions', 'always', $path], 'Partitioning', "label: gpt\n,,L\n");
+        run(['udevadm', 'settle', '--timeout=15'], null, 20);
+        $part = null;
+        for ($i = 0; $i < 40 && !$part; $i++) {
+            foreach (physical_disks() as $n) {
+                if ($n['path'] !== $path) continue;
+                foreach ($n['children'] ?? [] as $ch) if (($ch['type'] ?? '') === 'part') { $part = (string)$ch['path']; break; }
+            }
+            if (!$part) { usleep(250000); if ($i === 8) run(['partx', '-u', $path], null, 20); }
+        }
+        if (!$part || !preg_match('#^/dev/[a-z0-9]+$#', $part)) refuse('The new partition did not appear.');
+        must(['mkfs.ext4', '-F', '-q', '-L', FS_LABEL, '-m', '0', '-E', 'lazy_itable_init=1,lazy_journal_init=1', $part], 'Formatting', null, 1800);
+        $uuid = trim(must(['blkid', '-s', 'UUID', '-o', 'value', $part], 'Reading the disk id'));
+        if (!preg_match(UUID_RE, $uuid)) refuse('Unexpected disk id.');
+
+        // Mark it as a Black Vault disk and give the web its folder
+        $tmp = (T ? STATE_DIR : '/run') . '/blackvault-format-' . bin2hex(random_bytes(4));
+        mkdir($tmp, 0700);
+        try {
+            must(['mount', '-t', 'ext4', '-o', MOUNT_OPTS, $part, $tmp], 'Mounting');
+            [$uid, $gid] = web_ids();
+            write_json($tmp . '/.blackvault-disk', ['uuid' => $uuid, 'created' => time(), 'model' => $d['model'], 'serial' => $d['serial']]);
+            mkdir($tmp . '/storage', 0750);
+            chown($tmp . '/storage', $uid); chgrp($tmp . '/storage', $gid);
+            chmod($tmp, 0755);
+        } finally {
+            run(['umount', $tmp], null, 60);
+            @rmdir($tmp);
+        }
+        $c = connect_disk($uuid);
+        return ['uuid' => $uuid, 'model' => $d['model'], 'size' => $d['size']] + $c;
+    });
+}
+
+function connect_disk(string $uuid): array {
+    if (!preg_match(UUID_RE, $uuid)) refuse('Invalid disk.');
+    $mp = mountpoint_of($uuid);
+    if (disk_ready($uuid)) return ['connected' => true];
+    $found = find_bv_partition($uuid);
+    if (!$found) refuse('Disk not found. Is it plugged in?');
+    foreach ($found['disk']['partitions'] as $p) {
+        if ($p['uuid'] === $uuid && $p['mounted'] && !in_array($mp, $p['mounted'], true)) refuse('The disk is in use somewhere else.');
+    }
+    if (!is_dir(DISKS_DIR)) mkdir(DISKS_DIR, 0755, true);
+    if (!is_dir($mp)) mkdir($mp, 0755);
+    if (!is_mounted_at($mp)) {
+        if (count(scandir($mp)) > 2) refuse('The mount folder is not empty; nothing was changed.');
+        run(['chattr', '-i', $mp], null, 10);
+        chown($mp, 0); chgrp($mp, 0); chmod($mp, 0755);
+        run(['chattr', '+i', $mp], null, 10);         // nothing can be written there while the disk is away
+        must(['mount', '-t', 'ext4', '-o', MOUNT_OPTS, $found['part'], $mp], 'Mounting');
+    }
+    $m = read_json($mp . '/.blackvault-disk');
+    if (!$m || ($m['uuid'] ?? '') !== $uuid || !is_dir($mp . '/storage')) {
+        run(['umount', $mp], null, 60);
+        refuse('This disk was not prepared by Black Vault.');
+    }
+    [$uid, $gid] = web_ids();
+    $st = stat($mp . '/storage');
+    if ($st['uid'] !== $uid || $st['gid'] !== $gid) { chown($mp . '/storage', $uid); chgrp($mp . '/storage', $gid); }
+    chmod($mp . '/storage', 0750);
+    fstab_set($uuid, true);
+    $conf = storage_conf();
+    $conf['disks'][$uuid] = ['model' => $found['disk']['model'], 'serial' => $found['disk']['serial'], 'size' => $found['disk']['size'], 'added' => $conf['disks'][$uuid]['added'] ?? time()];
+    write_json(STORAGE_CONF, $conf);
+    return ['connected' => true];
+}
+
+function act_connect(array $r): array {
+    $uuid = (string)($r['uuid'] ?? '');
+    return with_lock(fn() => connect_disk($uuid));
+}
+
+function act_eject(array $r): array {
+    $uuid = (string)($r['uuid'] ?? '');
+    if (!preg_match(UUID_RE, $uuid)) refuse('Invalid disk.');
+    return with_lock(function () use ($uuid) {
+        $conf = storage_conf();
+        if ($conf['active'] === $uuid) refuse('This disk holds the drives. Move the drives to another disk before ejecting it.');
+        $mv = move_status();
+        if ($mv && in_array($mv['state'], ['running', 'verifying'], true) && in_array($uuid, [$mv['from'], $mv['to']], true)) refuse('Drives are being moved to or from this disk.');
+        $mp = mountpoint_of($uuid);
+        if (is_mounted_at($mp)) {
+            run(['sync'], null, 120);
+            [$c, , $e] = run(['umount', $mp], null, 120);
+            if ($c !== 0) refuse('The disk is busy. Try again in a minute.');
+        }
+        fstab_set($uuid, false);
+        if (is_dir($mp)) { run(['chattr', '-i', $mp], null, 10); @rmdir($mp); }
+        unset($conf['disks'][$uuid]);
+        write_json(STORAGE_CONF, $conf);
+        return ['ejected' => true];
+    });
+}
+
+/* -------------------------------------------------------------- moving */
+
+function move_status(): ?array {
+    $s = read_json(MOVE_STATUS);
+    if (!$s) return null;
+    // A move whose worker stopped (power cut, reboot…) is not "running" any more
+    if (in_array($s['state'] ?? '', ['running', 'verifying'], true) && time() - (int)($s['beat'] ?? 0) > 60) {
+        $s['state'] = 'failed';
+        $s['error'] = 'The move was interrupted. Nothing was switched; the drives stayed where they were.';
+    }
+    return $s;
+}
+
+function tree_size(string $dir): int {
+    $sum = 0;
+    if (!is_dir($dir)) return 0;
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+    foreach ($it as $f) { if (!$f->isLink() && $f->isFile()) $sum += $f->getSize(); }
+    return $sum;
+}
+
+/** Validates and starts a move. The copy itself runs after the answer is sent. */
+function act_move(array $r): array {
+    $to = (string)($r['to'] ?? '');
+    return with_lock(function () use ($to) {
+        $conf = storage_conf();
+        $from = $conf['active'];
+        if ($to !== 'internal' && !preg_match(UUID_RE, $to)) refuse('Invalid destination.');
+        if ($to === $from) refuse('The drives are already there.');
+        $mv = move_status();
+        if ($mv && in_array($mv['state'], ['running', 'verifying'], true)) refuse('A move is already in progress.');
+        if ($from !== 'internal' && !disk_ready($from)) refuse('The disk with the drives is not connected.');
+        if ($to !== 'internal' && !disk_ready($to)) refuse('Connect the destination disk first.');
+        $src = location_path($from);
+        $dst = location_path($to);
+        if (!is_dir($src)) refuse('The drives folder was not found.');
+        if (!is_dir($dst)) refuse('The destination folder was not found.');
+        $need = tree_size($src . '/users') + tree_size($src . '/trash');
+        $free = (float)@disk_free_space($dst) + tree_size($dst . '/users') + tree_size($dst . '/trash');
+        if ($free < $need * 1.02 + 256 * 1048576) refuse('Not enough space there: ' . human($need) . ' to copy, ' . human($free) . ' available.');
+        $status = ['state' => 'running', 'from' => $from, 'to' => $to, 'total' => $need, 'done' => 0, 'progress' => 0,
+                   'started' => time(), 'beat' => time(), 'phase' => 'Copying'];
+        write_json(MOVE_STATUS, $status);
+        $GLOBALS['AFTER'] = fn() => run_move($status, $src, $dst);
+        return ['started' => true, 'total' => $need];
+    });
+}
+
+/** Copy (as www-data) → verify → switch. Updates move.json as it goes. */
+function run_move(array $s, string $src, string $dst): void {
+    $save = function (array $patch) use (&$s) { $s = $patch + $s; $s['beat'] = time(); write_json(MOVE_STATUS, $s); };
+    $rsync = ['runuser', '-u', WEB_USER, '--', 'rsync', '-a', '--delete', '--no-inc-recursive',
+              '--exclude=/.htaccess', '--exclude=/.gitkeep'];
+    try {
+        $last = 0;
+        $code = stream_run(array_merge($rsync, ['--info=progress2', $src . '/', $dst . '/']), function (string $line) use ($save, &$last, $s) {
+            if (preg_match('/^\s*([\d,]+)\s+(\d+)%/', $line, $m)) {
+                $done = (int)str_replace(',', '', $m[1]);
+                if (time() - $last >= 2) { $last = time(); $save(['done' => $done, 'progress' => min(99, (int)$m[2])]); }
+            }
+        }, fn() => $save([]));
+        if ($code !== 0) throw new RuntimeException('Copy failed (rsync ' . $code . '). The drives stayed where they were.');
+
+        $save(['state' => 'verifying', 'phase' => 'Checking the copy', 'progress' => 99]);
+        $diff = '';
+        $code = stream_run(array_merge($rsync, ['--dry-run', '--itemize-changes', $src . '/', $dst . '/']), function (string $line) use (&$diff) {
+            if (trim($line) !== '') $diff .= $line . "\n";
+        }, fn() => $save([]));
+        if ($code !== 0 || $diff !== '') throw new RuntimeException('The copy could not be verified. The drives stayed where they were.');
+
+        with_lock(function () use ($s) {
+            $conf = storage_conf();
+            $conf['active'] = $s['to'];
+            write_json(STORAGE_CONF, $conf);
+        });
+        @chmod($dst, 0750);          // only the web user may look inside the drives
+        $save(['state' => 'done', 'phase' => 'Done', 'progress' => 100, 'finished' => time(), 'old' => $s['from']]);
+    } catch (Throwable $e) {
+        $save(['state' => 'failed', 'error' => $e->getMessage(), 'finished' => time()]);
+    }
+}
+
+/** Runs a command, calls $onLine per output line and $onTick every few seconds. */
+function stream_run(array $cmd, callable $onLine, callable $onTick): int {
+    $p = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    if (!is_resource($p)) return 127;
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+    $buf = '';
+    $tick = time();
+    while (true) {
+        $r = [$pipes[1], $pipes[2]]; $w = $e = null;
+        @stream_select($r, $w, $e, 2);
+        foreach ($r as $st) {
+            $chunk = (string)fread($st, 65536);
+            if ($st === $pipes[1]) {
+                $buf .= str_replace("\r", "\n", $chunk);
+                while (($i = strpos($buf, "\n")) !== false) { $onLine(substr($buf, 0, $i)); $buf = substr($buf, $i + 1); }
+            }
+        }
+        if (time() - $tick >= 5) { $tick = time(); $onTick(); }
+        $stt = proc_get_status($p);
+        if (!$stt['running']) {
+            $buf .= str_replace("\r", "\n", (string)stream_get_contents($pipes[1]));
+            foreach (explode("\n", $buf) as $l) if ($l !== '') $onLine($l);
+            fclose($pipes[1]); fclose($pipes[2]); proc_close($p);
+            return (int)$stt['exitcode'];
+        }
+    }
+}
+
+function act_remove_old(array $r): array {
+    $loc = (string)($r['location'] ?? '');
+    if ($loc !== 'internal' && !preg_match(UUID_RE, $loc)) refuse('Invalid location.');
+    return with_lock(function () use ($loc) {
+        $conf = storage_conf();
+        if ($loc === $conf['active']) refuse('The drives live there now: that is not an old copy.');
+        $mv = move_status();
+        if ($mv && in_array($mv['state'], ['running', 'verifying'], true)) refuse('Wait until the move finishes.');
+        if ($loc !== 'internal' && !disk_ready($loc)) refuse('Connect that disk first.');
+        $base = location_path($loc);
+        $freed = tree_size($base . '/users') + tree_size($base . '/trash');
+        foreach (['users', 'trash'] as $sub) {
+            if (is_dir($base . '/' . $sub) && !is_link($base . '/' . $sub)) {
+                must(['runuser', '-u', WEB_USER, '--', 'rm', '-rf', '--one-file-system', '--', $base . '/' . $sub], 'Removing the old copy', null, 3600);
+            }
+        }
+        if ($mv && ($mv['old'] ?? null) === $loc) { $mv['old'] = null; $mv['old_removed'] = time(); write_json(MOVE_STATUS, $mv); }
+        return ['freed' => $freed];
+    });
+}
+
+/* ------------------------------------------------------------- health */
+
+/** Turns smartctl's JSON into a short verdict. Public for the test suite. */
+function smart_verdict(array $j, ?array $prev): array {
+    $msgs = implode(' ', array_map(fn($m) => (string)($m['string'] ?? ''), $j['smartctl']['messages'] ?? []));
+    if (preg_match('/STANDBY|SLEEP/i', $msgs)) {
+        $v = $prev ?? ['status' => 'unknown', 'notes' => []];
+        $v['asleep'] = true;
+        if (($v['status'] ?? '') === 'unknown') $v['status'] = 'asleep';
+        return $v;
+    }
+    $v = ['status' => 'unknown', 'notes' => [], 'temp' => null, 'hours' => null, 'wear' => null, 'asleep' => false];
+    if (isset($j['temperature']['current'])) $v['temp'] = (int)$j['temperature']['current'];
+    if (isset($j['power_on_time']['hours'])) $v['hours'] = (int)$j['power_on_time']['hours'];
+    $passed = $j['smart_status']['passed'] ?? null;
+    if ($passed === null && !isset($j['ata_smart_attributes']) && !isset($j['nvme_smart_health_information_log'])) {
+        $v['notes'][] = 'This disk does not report its health' . (stripos($msgs, 'usb') !== false || stripos($msgs, 'bridge') !== false ? ' through its USB adapter' : '');
+        return $v;
+    }
+    $v['status'] = 'healthy';
+    $warn = function (string $n) use (&$v) { if ($v['status'] === 'healthy') $v['status'] = 'warning'; $v['notes'][] = $n; };
+    if ($passed === false) { $v['status'] = 'failing'; $v['notes'][] = 'The disk itself reports that it is failing. Copy your data off it now.'; }
+    foreach ($j['ata_smart_attributes']['table'] ?? [] as $a) {
+        $raw = (int)($a['raw']['value'] ?? 0);
+        switch ((int)($a['id'] ?? 0)) {
+            case 5:   if ($raw > 0) $warn($raw . ' damaged sectors were replaced'); break;
+            case 197: if ($raw > 0) $warn($raw . ' sectors are waiting to be replaced'); break;
+            case 198: if ($raw > 0) $warn($raw . ' sectors could not be read'); break;
+            case 177: case 231: case 233:
+                if (($a['name'] ?? '') && preg_match('/Wear|Life/i', (string)$a['name'])) $v['wear'] = max(0, 100 - (int)($a['value'] ?? 100));
+                break;
+        }
+        if (!empty($a['when_failed']) && $a['when_failed'] === 'now') { $v['status'] = 'failing'; $v['notes'][] = ($a['name'] ?? 'An attribute') . ' is below its safe limit'; }
+    }
+    $nv = $j['nvme_smart_health_information_log'] ?? null;
+    if ($nv) {
+        if ((int)($nv['critical_warning'] ?? 0) !== 0) { $v['status'] = 'failing'; $v['notes'][] = 'The SSD reports a critical warning'; }
+        if (isset($nv['percentage_used'])) { $v['wear'] = (int)$nv['percentage_used']; if ($v['wear'] >= 90) $warn('The SSD is ' . $v['wear'] . '% worn'); }
+        if ((int)($nv['media_errors'] ?? 0) > 0) $warn((int)$nv['media_errors'] . ' media errors');
+        if ($v['temp'] === null && isset($nv['temperature'])) $v['temp'] = (int)$nv['temperature'];
+    }
+    $hot = $nv ? 75 : 55;
+    if ($v['temp'] !== null && $v['temp'] >= $hot) $warn('Running hot (' . $v['temp'] . ' °C)');
+    $v['notes'] = array_values(array_unique($v['notes']));
+    return $v;
+}
+
+function act_smart(array $r): array {
+    $cache = read_json(SMART_CACHE) ?? ['at' => 0, 'disks' => []];
+    $want = !empty($r['refresh']) ? 60 : 600;            // a refresh at most once a minute
+    if (time() - (int)$cache['at'] < $want) return $cache;
+    $tool = is_executable('/usr/sbin/smartctl') ? '/usr/sbin/smartctl' : (is_executable('/usr/bin/smartctl') ? '/usr/bin/smartctl' : null);
+    $out = ['at' => time(), 'disks' => []];
+    foreach (physical_disks() as $n) {
+        $path = (string)$n['path'];
+        if (!preg_match(DEV_RE, $path)) continue;
+        $base = ['path' => $path, 'model' => trim((string)($n['model'] ?? '')) ?: 'Disk', 'size' => (int)$n['size'], 'checked' => time()];
+        if (!$tool || ($n['type'] ?? '') === 'loop') {
+            $out['disks'][$path] = $base + ['status' => 'unknown', 'notes' => [$tool ? 'Virtual disk' : 'Install smartmontools to see disk health'], 'temp' => null, 'hours' => null, 'wear' => null, 'asleep' => false];
+            continue;
+        }
+        $prev = $cache['disks'][$path] ?? null;
+        // -n standby: never spin up a sleeping disk just to ask how it is
+        [$c, $o] = run([$tool, '-j', '-a', '-n', 'standby', $path], null, 60);
+        $j = json_decode($o, true);
+        if (!is_array($j) || (($c & 2) && !preg_match('/STANDBY|SLEEP/i', $o))) {
+            [$c, $o] = run([$tool, '-j', '-a', '-n', 'standby', '-d', 'sat', $path], null, 60);
+            $j = json_decode($o, true);
+        }
+        $out['disks'][$path] = $base + smart_verdict(is_array($j) ? $j : [], $prev);
+    }
+    write_json(SMART_CACHE, $out);
+    return $out;
+}
+
+/* ===================================================================== */
+/*  Entry point                                                           */
+/* ===================================================================== */
+
+function dispatch(array $r): array {
+    $a = (string)($r['action'] ?? '');
+    switch ($a) {
+        case 'list':       return act_list();
+        case 'status':     return act_status();
+        case 'smart':      return act_smart($r);
+        case 'format':     return act_format($r);
+        case 'connect':    return act_connect($r);
+        case 'eject':      return act_eject($r);
+        case 'move':       return act_move($r);
+        case 'remove_old': return act_remove_old($r);
+    }
+    if (T && $a === 'test_verdict') return smart_verdict((array)($r['json'] ?? []), $r['prev'] ?? null);
+    refuse('Unknown action.');
+}
+
+if (posix_geteuid() !== 0) { fwrite(STDERR, "Run as root.\n"); exit(1); }
+foreach ([STATE_DIR, CONF_DIR] as $d) if (!is_dir($d)) mkdir($d, 0755, true);
+
+$socket = in_array('--socket', $argv, true);
+if ($socket) {
+    $line = fgets(STDIN, 65536);
+    $req = json_decode((string)$line, true);
+} else {
+    $req = isset($argv[1]) && $argv[1] !== '' && $argv[1][0] === '{' ? json_decode($argv[1], true) : ['action' => $argv[1] ?? 'help'];
+    if (($req['action'] ?? '') === 'help') {
+        fwrite(STDOUT, "Black Vault disk service. From the terminal: blackvault-disk list | smart | status\n");
+        exit(0);
+    }
+    // From the terminal only the read-only actions, unless it is the test harness
+    if (!T && !in_array($req['action'] ?? '', ['list', 'smart', 'status'], true)) { fwrite(STDERR, "Use the Admin panel for changes.\n"); exit(1); }
+}
+
+try {
+    if (!is_array($req)) refuse('Invalid request.');
+    $res = ['ok' => true] + dispatch($req);
+} catch (Refused $e) {
+    $res = ['ok' => false, 'error' => $e->getMessage()];
+} catch (Throwable $e) {
+    error_log('blackvault-disk: ' . $e->getMessage());
+    $res = ['ok' => false, 'error' => 'The disk service hit an unexpected error. Details are in the system log.'];
+}
+
+echo json_encode($res, $socket ? 0 : JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), "\n";
+if (isset($GLOBALS['AFTER'])) {
+    // Answer first, then do the long work (the web is not kept waiting)
+    fflush(STDOUT);
+    fclose(STDOUT);
+    if (is_resource(STDIN)) fclose(STDIN);
+    ($GLOBALS['AFTER'])();
+}
+exit($res['ok'] ? 0 : 1);
