@@ -216,6 +216,12 @@ Plain PHP, JavaScript and CSS, with no frameworks and no build step.
 
 Bug reports and ideas are welcome: open an [issue](https://github.com/bursec-official/blackvault/issues). For pull requests, see [CONTRIBUTING.md](CONTRIBUTING.md). Please report security problems privately, as explained in [SECURITY.md](SECURITY.md).
 
+## Author
+
+Black Vault is created, owned and maintained by **[bursec-official](https://github.com/bursec-official)**. All rights belong to the author, except the permissions given in the [LICENSE](LICENSE).
+
+AI tools ([Claude](https://claude.ai), by Anthropic) were used as a work tool during development. That is why Claude appears among the contributors. It gives Anthropic no ownership of or rights over the project. See [NOTICE](NOTICE.md).
+
 ## License
 
 Black Vault is **free to use for everyone**, companies included, under the [PolyForm Shield License 1.0.0](LICENSE).
